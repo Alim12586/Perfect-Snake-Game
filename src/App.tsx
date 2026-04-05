@@ -41,6 +41,7 @@ interface Food {
 
 export default function App() {
   const [socket, setSocket] = useState<any>(null);
+  const [isConnected, setIsConnected] = useState(false);
   const [players, setPlayers] = useState<Record<string, Player>>({});
   const [foods, setFoods] = useState<Food[]>([]);
   const [me, setMe] = useState<Player | null>(null);
@@ -58,6 +59,9 @@ export default function App() {
   useEffect(() => {
     const newSocket = io();
     setSocket(newSocket);
+
+    newSocket.on("connect", () => setIsConnected(true));
+    newSocket.on("disconnect", () => setIsConnected(false));
 
     newSocket.on("init", ({ players, foods }) => {
       setPlayers(players);
@@ -78,9 +82,6 @@ export default function App() {
         delete next[id];
         return next;
       });
-      if (spectateTargetId === id) {
-        setSpectateTargetId(null);
-      }
     });
 
     newSocket.on("foodUpdated", ({ removedId, added }) => {
@@ -98,7 +99,14 @@ export default function App() {
     return () => {
       newSocket.close();
     };
-  }, [spectateTargetId]);
+  }, []);
+
+  // Handle spectate target changes without reconnecting
+  useEffect(() => {
+    if (gameState === "spectating" && spectateTargetId && !players[spectateTargetId]) {
+      setSpectateTargetId(null);
+    }
+  }, [players, gameState, spectateTargetId]);
 
   // Update leaderboard
   useEffect(() => {
@@ -405,10 +413,16 @@ export default function App() {
       />
 
       {/* UI Overlays */}
-      <div className="absolute top-4 left-4 pointer-events-none">
+      <div className="absolute top-4 left-4 pointer-events-none flex flex-col gap-2">
         <div className="flex items-center gap-2 bg-black/50 backdrop-blur-md p-3 rounded-xl border border-white/10">
           <Users className="w-5 h-5 text-blue-400" />
           <span className="font-bold">{Object.keys(players).length} Players Online</span>
+        </div>
+        <div className="flex items-center gap-2 bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 w-fit">
+          <div className={cn("w-2 h-2 rounded-full", isConnected ? "bg-green-500" : "bg-red-500 animate-pulse")} />
+          <span className="text-[10px] uppercase tracking-widest font-bold text-white/50">
+            {isConnected ? "Server Connected" : "Connecting..."}
+          </span>
         </div>
       </div>
 

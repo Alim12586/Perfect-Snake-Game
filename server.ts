@@ -23,8 +23,8 @@ async function startServer() {
   // Game state
   const players: Record<string, any> = {};
   const foods: any[] = [];
-  const MAX_FOOD = 50;
-  const GRID_SIZE = 1000;
+  const MAX_FOOD = 100;
+  const GRID_SIZE = 2000;
 
   function spawnFood() {
     return {
@@ -46,10 +46,8 @@ async function startServer() {
 
     socket.on("join", (playerData) => {
       players[socket.id] = {
-        id: socket.id,
         ...playerData,
-        score: 0,
-        segments: [{ x: Math.random() * GRID_SIZE, y: Math.random() * GRID_SIZE }],
+        id: socket.id,
       };
       socket.emit("init", { players, foods });
       socket.broadcast.emit("playerJoined", players[socket.id]);
