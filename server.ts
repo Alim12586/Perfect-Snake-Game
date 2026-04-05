@@ -23,21 +23,27 @@ async function startServer() {
   // Game state
   const players: Record<string, any> = {};
   const foods: any[] = [];
-  const MAX_FOOD = 100;
-  const GRID_SIZE = 2000;
+  
+  let config = {
+    gridSize: 2000,
+    maxFood: 100,
+    initialSegments: 5,
+    baseSpeed: 3,
+    boostSpeed: 6,
+  };
 
   function spawnFood() {
     return {
       id: Math.random().toString(36).substring(2, 9),
-      x: Math.floor(Math.random() * GRID_SIZE),
-      y: Math.floor(Math.random() * GRID_SIZE),
+      x: Math.floor(Math.random() * config.gridSize),
+      y: Math.floor(Math.random() * config.gridSize),
       color: `hsl(${Math.random() * 360}, 70%, 50%)`,
       size: 5 + Math.random() * 5,
     };
   }
 
   // Initial food
-  for (let i = 0; i < MAX_FOOD; i++) {
+  for (let i = 0; i < config.maxFood; i++) {
     foods.push(spawnFood());
   }
 
@@ -49,8 +55,23 @@ async function startServer() {
         ...playerData,
         id: socket.id,
       };
-      socket.emit("init", { players, foods });
+      socket.emit("init", { players, foods, config });
       socket.broadcast.emit("playerJoined", players[socket.id]);
+    });
+
+    socket.on("updateSettings", (newConfig) => {
+      config = { ...config, ...newConfig };
+      // If food count changed, adjust it
+      while (foods.length < config.maxFood) {
+        const food = spawnFood();
+        foods.push(food);
+        io.emit("foodAdded", food);
+      }
+      while (foods.length > config.maxFood) {
+        const removed = foods.pop();
+        io.emit("foodUpdated", { removedId: removed.id });
+      }
+      io.emit("settingsUpdated", config);
     });
 
     socket.on("update", (playerData) => {
@@ -91,6 +112,16 @@ async function startServer() {
         delete players[socket.id];
         io.emit("playerLeft", socket.id);
       }
+    });
+
+    socket.on("chatMessage", (message) => {
+      const chatMsg = {
+        id: Math.random().toString(36).substring(2, 9),
+        sender: players[socket.id]?.name || "Spectator",
+        text: message.slice(0, 200),
+        timestamp: Date.now(),
+      };
+      io.emit("chatMessage", chatMsg);
     });
 
     socket.on("disconnect", () => {

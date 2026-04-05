@@ -2,7 +2,17 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 import io from "socket.io-client";
 import type { Socket } from "socket.io-client";
 import { motion, AnimatePresence } from "motion/react";
-import { Trophy, Users, Zap, MousePointer2 } from "lucide-react";
+import { GoogleGenAI } from "@google/genai";
+import {
+  Trophy,
+  Users,
+  Zap,
+  MousePointer2,
+  Settings,
+  X,
+  Save,
+  Sparkles,
+} from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
@@ -10,11 +20,15 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const GRID_SIZE = 2000;
-const INITIAL_SEGMENTS = 5;
 const SEGMENT_SPACING = 15;
-const BASE_SPEED = 3;
-const BOOST_SPEED = 6;
+
+interface GameConfig {
+  gridSize: number;
+  maxFood: number;
+  initialSegments: number;
+  baseSpeed: number;
+  boostSpeed: number;
+}
 
 interface Point {
   x: number;
@@ -39,6 +53,13 @@ interface Food {
   size: number;
 }
 
+interface ChatMessage {
+  id: string;
+  sender: string;
+  text: string;
+  timestamp: number;
+}
+
 export default function App() {
   const [socket, setSocket] = useState<any>(null);
   const [isConnected, setIsConnected] = useState(false);
@@ -46,9 +67,25 @@ export default function App() {
   const [foods, setFoods] = useState<Food[]>([]);
   const [me, setMe] = useState<Player | null>(null);
   const [gameState, setGameState] = useState<"menu" | "playing" | "dead" | "spectating">("menu");
+  const [isPaused, setIsPaused] = useState(false);
   const [playerName, setPlayerName] = useState("");
   const [leaderboard, setLeaderboard] = useState<Player[]>([]);
   const [spectateTargetId, setSpectateTargetId] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isPlayerChatVisible, setIsPlayerChatVisible] = useState(false);
+  const [geminiTip, setGeminiTip] = useState<string | null>(null);
+  const [isGeneratingTip, setIsGeneratingTip] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [gameConfig, setGameConfig] = useState<GameConfig>({
+    gridSize: 2000,
+    maxFood: 100,
+    initialSegments: 5,
+    baseSpeed: 3,
+    boostSpeed: 6,
+  });
+  const [tempConfig, setTempConfig] = useState<GameConfig>(gameConfig);
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const requestRef = useRef<number>(null);
@@ -63,9 +100,18 @@ export default function App() {
     newSocket.on("connect", () => setIsConnected(true));
     newSocket.on("disconnect", () => setIsConnected(false));
 
-    newSocket.on("init", ({ players, foods }) => {
+    newSocket.on("init", ({ players, foods, config }) => {
       setPlayers(players);
       setFoods(foods);
+      if (config) {
+        setGameConfig(config);
+        setTempConfig(config);
+      }
+    });
+
+    newSocket.on("settingsUpdated", (config: GameConfig) => {
+      setGameConfig(config);
+      setTempConfig(config);
     });
 
     newSocket.on("playerJoined", (player) => {
@@ -96,6 +142,10 @@ export default function App() {
       setFoods((prev) => [...prev, food]);
     });
 
+    newSocket.on("chatMessage", (message: ChatMessage) => {
+      setChatMessages((prev) => [...prev.slice(-49), message]);
+    });
+
     return () => {
       newSocket.close();
     };
@@ -119,11 +169,38 @@ export default function App() {
     }
   }, [players, gameState, spectateTargetId]);
 
+  const generateGeminiTip = async (score: number) => {
+    if (!process.env.GEMINI_API_KEY) return;
+    
+    setIsGeneratingTip(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `I just played a multiplayer snake game and got a score of ${score}. Give me a very short, witty, and encouraging tip (max 15 words) on how to improve or just a funny comment about my performance.`,
+      });
+      setGeminiTip(response.text || "Keep growing, little snake!");
+    } catch (error) {
+      console.error("Gemini Error:", error);
+      setGeminiTip("The arena is tough, but you're tougher!");
+    } finally {
+      setIsGeneratingTip(false);
+    }
+  };
+
+  useEffect(() => {
+    if (gameState === "dead" && me) {
+      generateGeminiTip(me.score);
+    } else if (gameState !== "dead") {
+      setGeminiTip(null);
+    }
+  }, [gameState, me?.score]);
+
   const joinGame = () => {
     if (!socket || !playerName.trim()) return;
     const color = `hsl(${Math.random() * 360}, 70%, 50%)`;
-    const startPos = { x: Math.random() * GRID_SIZE, y: Math.random() * GRID_SIZE };
-    const segments = Array.from({ length: INITIAL_SEGMENTS }, (_, i) => ({
+    const startPos = { x: Math.random() * gameConfig.gridSize, y: Math.random() * gameConfig.gridSize };
+    const segments = Array.from({ length: gameConfig.initialSegments }, (_, i) => ({
       x: startPos.x - i * SEGMENT_SPACING,
       y: startPos.y,
     }));
@@ -151,6 +228,17 @@ export default function App() {
     }
   };
 
+  const sendChatMessage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!socket || !chatInput.trim()) return;
+    socket.emit("chatMessage", chatInput);
+    setChatInput("");
+  };
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages]);
+
   const handleMouseMove = (e: React.MouseEvent | React.TouchEvent) => {
     if (gameState !== "playing") return;
     const canvas = canvasRef.current;
@@ -173,19 +261,31 @@ export default function App() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.target instanceof HTMLInputElement) return;
+    if (e.code === "Escape" || e.code === "KeyP") {
+      if (gameState === "playing") {
+        setIsPaused((prev) => !prev);
+      }
+    }
+    if (e.code === "KeyC") {
+      if (gameState === "playing") {
+        setIsPlayerChatVisible((prev) => !prev);
+      }
+    }
     if (e.code === "Space" || e.code === "ShiftLeft") {
       setMe((prev) => prev ? { ...prev, isBoosting: true } : null);
     }
   };
 
   const handleKeyUp = (e: React.KeyboardEvent) => {
+    if (e.target instanceof HTMLInputElement) return;
     if (e.code === "Space" || e.code === "ShiftLeft") {
       setMe((prev) => prev ? { ...prev, isBoosting: false } : null);
     }
   };
 
   const gameLoop = useCallback((time: number) => {
-    if (gameState === "menu" || !socket) return;
+    if (gameState === "menu" || !socket || isPaused) return;
 
     const dt = time - (lastUpdateTime.current || time);
     lastUpdateTime.current = time;
@@ -200,11 +300,11 @@ export default function App() {
       const newAngle = me.angle + normalizedDiff * 0.1;
 
       // Move head
-      const speed = me.isBoosting ? BOOST_SPEED : BASE_SPEED;
+      const speed = me.isBoosting ? gameConfig.boostSpeed : gameConfig.baseSpeed;
       const head = me.segments[0];
       const newHead = {
-        x: (head.x + Math.cos(newAngle) * speed + GRID_SIZE) % GRID_SIZE,
-        y: (head.y + Math.sin(newAngle) * speed + GRID_SIZE) % GRID_SIZE,
+        x: (head.x + Math.cos(newAngle) * speed + gameConfig.gridSize) % gameConfig.gridSize,
+        y: (head.y + Math.sin(newAngle) * speed + gameConfig.gridSize) % gameConfig.gridSize,
       };
 
       // Update segments
@@ -307,14 +407,14 @@ export default function App() {
         // Draw grid
         ctx.strokeStyle = "#333";
         ctx.lineWidth = 1;
-        for (let i = 0; i <= GRID_SIZE; i += 100) {
+        for (let i = 0; i <= gameConfig.gridSize; i += 100) {
           ctx.beginPath();
           ctx.moveTo(i, 0);
-          ctx.lineTo(i, GRID_SIZE);
+          ctx.lineTo(i, gameConfig.gridSize);
           ctx.stroke();
           ctx.beginPath();
           ctx.moveTo(0, i);
-          ctx.lineTo(GRID_SIZE, i);
+          ctx.lineTo(gameConfig.gridSize, i);
           ctx.stroke();
         }
 
@@ -387,10 +487,27 @@ export default function App() {
     ctx.fill();
 
     // Name
-    ctx.fillStyle = "white";
-    ctx.font = "12px sans-serif";
+    ctx.font = "bold 12px sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText(player.name, player.segments[0].x, player.segments[0].y - 25);
+    const textWidth = ctx.measureText(player.name).width;
+    const nameX = player.segments[0].x;
+    const nameY = player.segments[0].y - 28;
+    
+    // Subtle background pill for readability
+    ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+    const bgWidth = textWidth + 12;
+    const bgHeight = 18;
+    ctx.beginPath();
+    // Use roundRect if available, fallback to rect
+    if (ctx.roundRect) {
+      ctx.roundRect(nameX - bgWidth / 2, nameY - 13, bgWidth, bgHeight, 9);
+    } else {
+      ctx.rect(nameX - bgWidth / 2, nameY - 13, bgWidth, bgHeight);
+    }
+    ctx.fill();
+
+    ctx.fillStyle = "white";
+    ctx.fillText(player.name, nameX, nameY);
   };
 
   useEffect(() => {
@@ -399,6 +516,12 @@ export default function App() {
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
     };
   }, [gameLoop]);
+
+  const saveSettings = () => {
+    if (!socket) return;
+    socket.emit("updateSettings", tempConfig);
+    setIsSettingsOpen(false);
+  };
 
   return (
     <div className="relative w-full h-screen bg-neutral-950 overflow-hidden font-sans text-white" onKeyDown={handleKeyDown} onKeyUp={handleKeyUp} tabIndex={0}>
@@ -434,7 +557,7 @@ export default function App() {
           </div>
           <div className="space-y-2">
             {leaderboard.map((player, i) => (
-              <div key={player.id} className={cn("flex justify-between items-center text-sm", player.id === socket?.id && "text-yellow-400 font-bold")}>
+              <div key={`${player.id}-${i}`} className={cn("flex justify-between items-center text-sm", player.id === socket?.id && "text-yellow-400 font-bold")}>
                 <span className="truncate max-w-[120px]">{i + 1}. {player.name}</span>
                 <span>{player.score}</span>
               </div>
@@ -465,6 +588,130 @@ export default function App() {
 
       {/* Menus */}
       <AnimatePresence>
+        {isSettingsOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-black/80 backdrop-blur-xl flex items-center justify-center z-[100] p-6"
+          >
+            <motion.div
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              className="bg-neutral-900 border border-white/10 rounded-[2.5rem] w-full max-w-xl overflow-hidden"
+            >
+              <div className="p-8 border-b border-white/5 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-white/5 rounded-xl">
+                    <Settings className="w-6 h-6 text-white" />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-black tracking-tight">Arena Settings</h2>
+                    <p className="text-white/40 text-xs uppercase tracking-widest font-bold">Global Configuration</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsSettingsOpen(false)}
+                  className="p-2 hover:bg-white/5 rounded-full transition-colors"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="p-8 space-y-6 max-h-[60vh] overflow-y-auto scrollbar-hide">
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Grid Size</label>
+                    <input
+                      type="number"
+                      value={tempConfig.gridSize}
+                      onChange={(e) => setTempConfig({ ...tempConfig, gridSize: parseInt(e.target.value) || 0 })}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Food Count</label>
+                    <input
+                      type="number"
+                      value={tempConfig.maxFood}
+                      onChange={(e) => setTempConfig({ ...tempConfig, maxFood: parseInt(e.target.value) || 0 })}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Initial Length</label>
+                    <input
+                      type="number"
+                      value={tempConfig.initialSegments}
+                      onChange={(e) => setTempConfig({ ...tempConfig, initialSegments: parseInt(e.target.value) || 0 })}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Base Speed</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={tempConfig.baseSpeed}
+                      onChange={(e) => setTempConfig({ ...tempConfig, baseSpeed: parseFloat(e.target.value) || 0 })}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Boost Speed</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={tempConfig.boostSpeed}
+                      onChange={(e) => setTempConfig({ ...tempConfig, boostSpeed: parseFloat(e.target.value) || 0 })}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-8 bg-white/5 border-t border-white/5 flex gap-4">
+                <button
+                  onClick={() => setIsSettingsOpen(false)}
+                  className="flex-1 bg-white/5 hover:bg-white/10 text-white font-bold py-4 rounded-2xl transition-all border border-white/10"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={saveSettings}
+                  className="flex-1 bg-white text-black font-bold py-4 rounded-2xl hover:scale-[1.02] active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+                >
+                  <Save className="w-5 h-5" />
+                  Save Changes
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+
+        {isPaused && gameState === "playing" && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-[60]"
+          >
+            <div className="text-center space-y-6">
+              <h2 className="text-7xl font-black tracking-tighter text-white drop-shadow-2xl">PAUSED</h2>
+              <button
+                onClick={() => setIsPaused(false)}
+                className="bg-white text-black font-bold px-12 py-4 rounded-2xl text-xl hover:scale-105 transition-all"
+              >
+                Resume Game
+              </button>
+              <div className="space-y-1">
+                <p className="text-white/50 text-sm uppercase tracking-widest">Press ESC or P to Resume</p>
+                <p className="text-white/30 text-[10px] uppercase tracking-widest">Press C to toggle Chat</p>
+              </div>
+            </div>
+          </motion.div>
+        )}
+
         {gameState === "menu" && (
           <motion.div
             initial={{ opacity: 0 }}
@@ -503,6 +750,13 @@ export default function App() {
                     Spectate
                   </button>
                 </div>
+                <button
+                  onClick={() => setIsSettingsOpen(true)}
+                  className="w-full bg-white/5 text-white/70 font-bold text-sm py-3 rounded-xl hover:bg-white/10 transition-all border border-white/5 flex items-center justify-center gap-2"
+                >
+                  <Settings className="w-4 h-4" />
+                  Arena Settings
+                </button>
               </div>
 
               <div className="grid grid-cols-2 gap-4 text-left text-sm text-white/40">
@@ -538,6 +792,34 @@ export default function App() {
                 <div className="text-5xl font-black">{me?.score}</div>
               </div>
 
+              {geminiTip && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="bg-white/5 p-6 rounded-2xl border border-white/10 relative overflow-hidden group"
+                >
+                  <div className="absolute top-0 left-0 w-1 h-full bg-blue-500" />
+                  <div className="flex items-start gap-3 text-left">
+                    <div className="p-2 bg-blue-500/10 rounded-lg">
+                      <Sparkles className="w-4 h-4 text-blue-400" />
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-black uppercase tracking-widest text-blue-400 mb-1">Gemini Coach</div>
+                      <p className="text-sm text-white/80 italic leading-relaxed">"{geminiTip}"</p>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+
+              {isGeneratingTip && (
+                <div className="flex items-center justify-center gap-2 text-white/30 py-4">
+                  <div className="w-1.5 h-1.5 bg-white/30 rounded-full animate-bounce [animation-delay:-0.3s]" />
+                  <div className="w-1.5 h-1.5 bg-white/30 rounded-full animate-bounce [animation-delay:-0.15s]" />
+                  <div className="w-1.5 h-1.5 bg-white/30 rounded-full animate-bounce" />
+                  <span className="text-[10px] font-bold uppercase tracking-widest ml-2">Consulting the Oracle...</span>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-4">
                 <button
                   onClick={() => setGameState("menu")}
@@ -554,6 +836,62 @@ export default function App() {
               </div>
             </div>
           </motion.div>
+        )}
+
+        {(gameState === "spectating" || (gameState === "playing" && (isPaused || isPlayerChatVisible))) && (
+          <>
+            <motion.div
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 20 }}
+              className="absolute top-20 right-4 w-80 h-96 bg-black/60 backdrop-blur-xl border border-white/10 rounded-3xl flex flex-col overflow-hidden z-50"
+            >
+              <div className="p-4 border-b border-white/10 flex items-center justify-between bg-white/5">
+                <span className="text-xs font-black uppercase tracking-widest text-white/50">
+                  {gameState === "spectating" ? "Spectator Chat" : "Arena Chat"}
+                </span>
+                <div className="flex items-center gap-2">
+                  <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-green-500/70">Live</span>
+                </div>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-hide">
+                {chatMessages.length === 0 ? (
+                  <div className="h-full flex items-center justify-center text-white/20 text-xs italic">
+                    No messages yet...
+                  </div>
+                ) : (
+                  chatMessages.map((msg, i) => (
+                    <div key={`${msg.id}-${i}`} className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-black text-white/40 uppercase tracking-tighter">
+                          {msg.sender}
+                        </span>
+                        <span className="text-[8px] text-white/20">
+                          {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                      <p className="text-sm text-white/80 leading-relaxed break-words bg-white/5 p-2 rounded-xl rounded-tl-none border border-white/5">
+                        {msg.text}
+                      </p>
+                    </div>
+                  ))
+                )}
+                <div ref={chatEndRef} />
+              </div>
+
+              <form onSubmit={sendChatMessage} className="p-4 bg-black/40 border-t border-white/10">
+                <input
+                  type="text"
+                  placeholder="Type a message..."
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                />
+              </form>
+            </motion.div>
+          </>
         )}
 
         {gameState === "spectating" && (
