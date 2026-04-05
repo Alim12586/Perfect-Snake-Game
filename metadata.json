@@ -1,0 +1,5 @@
+{
+  "name": "Multiplayer Snake Arena",
+  "description": "A real-time multiplayer snake game where you grow by eating food and compete with others. Small snakes collide with larger ones at their peril!",
+  "requestFramePermissions": []
+}
