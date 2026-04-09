@@ -15,6 +15,18 @@ import {
 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { sounds } from "./lib/sounds";
+import { db } from "./firebase";
+import { 
+  collection, 
+  addDoc, 
+  query, 
+  orderBy, 
+  limit, 
+  onSnapshot, 
+  serverTimestamp,
+  Timestamp
+} from "firebase/firestore";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -25,9 +37,12 @@ const SEGMENT_SPACING = 15;
 interface GameConfig {
   gridSize: number;
   maxFood: number;
+  maxPowerups: number;
+  maxObstacles: number;
   initialSegments: number;
   baseSpeed: number;
   boostSpeed: number;
+  isTeamMode: boolean;
 }
 
 interface Point {
@@ -43,6 +58,7 @@ interface Player {
   segments: Point[];
   angle: number;
   isBoosting: boolean;
+  team?: "red" | "blue";
 }
 
 interface Food {
@@ -51,6 +67,37 @@ interface Food {
   y: number;
   color: string;
   size: number;
+}
+
+interface Powerup {
+  id: string;
+  x: number;
+  y: number;
+  type: "speed" | "invincibility" | "magnet" | "multiplier";
+  color: string;
+}
+
+interface GlobalHighScore {
+  id: string;
+  playerName: string;
+  score: number;
+  timestamp: any;
+  team?: string;
+}
+
+interface Obstacle {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  isMoving: boolean;
+  color: string;
+}
+
+interface ActivePowerup {
+  type: string;
+  endTime: number;
 }
 
 interface ChatMessage {
@@ -65,6 +112,12 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [players, setPlayers] = useState<Record<string, Player>>({});
   const [foods, setFoods] = useState<Food[]>([]);
+  const [powerups, setPowerups] = useState<Powerup[]>([]);
+  const [obstacles, setObstacles] = useState<Obstacle[]>([]);
+  const [activePowerups, setActivePowerups] = useState<Record<string, number>>({});
+  const [teamScores, setTeamScores] = useState<Record<string, number>>({ red: 0, blue: 0 });
+  const [globalHighScores, setGlobalHighScores] = useState<GlobalHighScore[]>([]);
+  const [selectedTeam, setSelectedTeam] = useState<"red" | "blue">("red");
   const [me, setMe] = useState<Player | null>(null);
   const [gameState, setGameState] = useState<"menu" | "playing" | "dead" | "spectating">("menu");
   const [isPaused, setIsPaused] = useState(false);
@@ -76,13 +129,17 @@ export default function App() {
   const [isPlayerChatVisible, setIsPlayerChatVisible] = useState(false);
   const [geminiTip, setGeminiTip] = useState<string | null>(null);
   const [isGeneratingTip, setIsGeneratingTip] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [gameConfig, setGameConfig] = useState<GameConfig>({
     gridSize: 2000,
     maxFood: 100,
+    maxPowerups: 5,
+    maxObstacles: 15,
     initialSegments: 5,
     baseSpeed: 3,
     boostSpeed: 6,
+    isTeamMode: true,
   });
   const [tempConfig, setTempConfig] = useState<GameConfig>(gameConfig);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -91,6 +148,11 @@ export default function App() {
   const requestRef = useRef<number>(null);
   const mouseRef = useRef<Point>({ x: 0, y: 0 });
   const lastUpdateTime = useRef<number>(0);
+  const gameStateRef = useRef(gameState);
+
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
 
   // Initialize socket
   useEffect(() => {
@@ -100,9 +162,12 @@ export default function App() {
     newSocket.on("connect", () => setIsConnected(true));
     newSocket.on("disconnect", () => setIsConnected(false));
 
-    newSocket.on("init", ({ players, foods, config }) => {
+    newSocket.on("init", ({ players, foods, powerups, obstacles, config, teamScores }) => {
       setPlayers(players);
       setFoods(foods);
+      setPowerups(powerups || []);
+      setObstacles(obstacles || []);
+      if (teamScores) setTeamScores(teamScores);
       if (config) {
         setGameConfig(config);
         setTempConfig(config);
@@ -142,12 +207,49 @@ export default function App() {
       setFoods((prev) => [...prev, food]);
     });
 
+    newSocket.on("powerupUpdated", ({ removedId, added }) => {
+      setPowerups((prev) => {
+        const next = prev.filter((p) => p.id !== removedId);
+        if (added) next.push(added);
+        return next;
+      });
+    });
+
+    newSocket.on("obstaclesUpdated", (updatedObstacles) => {
+      setObstacles(updatedObstacles);
+    });
+
+    newSocket.on("powerupCollected", (type) => {
+      sounds.playPowerup();
+      setActivePowerups((prev) => ({
+        ...prev,
+        [type]: Date.now() + 10000, // 10 seconds duration
+      }));
+    });
+
+    newSocket.on("teamScoresUpdated", (scores) => {
+      setTeamScores(scores);
+    });
+
     newSocket.on("chatMessage", (message: ChatMessage) => {
       setChatMessages((prev) => [...prev.slice(-49), message]);
     });
 
+    // Global High Scores Listener
+    const q = query(collection(db, "high_scores"), orderBy("score", "desc"), limit(10));
+    const unsubscribeScores = onSnapshot(q, (snapshot) => {
+      const scores: GlobalHighScore[] = [];
+      snapshot.forEach((doc) => {
+        scores.push({ id: doc.id, ...doc.data() } as GlobalHighScore);
+      });
+      setGlobalHighScores(scores);
+    }, (error) => {
+      console.error("Firestore Error (GET high_scores):", error);
+    });
+
     return () => {
       newSocket.close();
+      unsubscribeScores();
     };
   }, []);
 
@@ -179,8 +281,19 @@ export default function App() {
         model: "gemini-3-flash-preview",
         contents: `I just played a multiplayer snake game and got a score of ${score}. Give me a very short, witty, and encouraging tip (max 15 words) on how to improve or just a funny comment about my performance.`,
       });
-      setGeminiTip(response.text || "Keep growing, little snake!");
-    } catch (error) {
+      
+      // Only set tip if we are still in the dead state
+      setGeminiTip((prev) => {
+        if (gameStateRef.current === "dead") {
+          return response.text || "Keep growing, little snake!";
+        }
+        return prev;
+      });
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Gemini request was aborted');
+        return;
+      }
       console.error("Gemini Error:", error);
       setGeminiTip("The arena is tough, but you're tougher!");
     } finally {
@@ -196,9 +309,17 @@ export default function App() {
     }
   }, [gameState, me?.score]);
 
+  useEffect(() => {
+    sounds.setMuted(isMuted);
+  }, [isMuted]);
+
   const joinGame = () => {
+    sounds.playClick();
     if (!socket || !playerName.trim()) return;
-    const color = `hsl(${Math.random() * 360}, 70%, 50%)`;
+    const color = gameConfig.isTeamMode 
+      ? (selectedTeam === "red" ? "#ef4444" : "#3b82f6")
+      : `hsl(${Math.random() * 360}, 70%, 50%)`;
+      
     const startPos = { x: Math.random() * gameConfig.gridSize, y: Math.random() * gameConfig.gridSize };
     const segments = Array.from({ length: gameConfig.initialSegments }, (_, i) => ({
       x: startPos.x - i * SEGMENT_SPACING,
@@ -213,6 +334,7 @@ export default function App() {
       segments,
       angle: 0,
       isBoosting: false,
+      team: gameConfig.isTeamMode ? selectedTeam : undefined,
     };
 
     setMe(initialPlayer);
@@ -222,6 +344,7 @@ export default function App() {
   };
 
   const startSpectating = () => {
+    sounds.playClick();
     setGameState("spectating");
     if (leaderboard.length > 0) {
       setSpectateTargetId(leaderboard[0].id);
@@ -284,6 +407,21 @@ export default function App() {
     }
   };
 
+  const recordHighScore = async (player: Player) => {
+    if (player.score <= 0) return;
+    
+    try {
+      await addDoc(collection(db, "high_scores"), {
+        playerName: player.name,
+        score: player.score,
+        timestamp: serverTimestamp(),
+        team: player.team || null
+      });
+    } catch (error) {
+      console.error("Firestore Error (WRITE high_scores):", error);
+    }
+  };
+
   const gameLoop = useCallback((time: number) => {
     if (gameState === "menu" || !socket || isPaused) return;
 
@@ -300,7 +438,10 @@ export default function App() {
       const newAngle = me.angle + normalizedDiff * 0.1;
 
       // Move head
-      const speed = me.isBoosting ? gameConfig.boostSpeed : gameConfig.baseSpeed;
+      let speed = me.isBoosting ? gameConfig.boostSpeed : gameConfig.baseSpeed;
+      if (activePowerups["speed"] && activePowerups["speed"] > Date.now()) {
+        speed *= 1.5;
+      }
       const head = me.segments[0];
       const newHead = {
         x: (head.x + Math.cos(newAngle) * speed + gameConfig.gridSize) % gameConfig.gridSize,
@@ -331,13 +472,25 @@ export default function App() {
       // Check collisions with food
       let newScore = me.score;
       let segmentsToAdd = 0;
+      const isMagnetActive = activePowerups["magnet"] && activePowerups["magnet"] > Date.now();
+      const scoreMultiplier = activePowerups["multiplier"] && activePowerups["multiplier"] > Date.now() ? 2 : 1;
+
       foods.forEach((food) => {
         const dx = newHead.x - food.x;
         const dy = newHead.y - food.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
+        
+        // Magnet effect
+        if (isMagnetActive && dist < 150) {
+          const angle = Math.atan2(dy, dx);
+          food.x += Math.cos(angle + Math.PI) * 5;
+          food.y += Math.sin(angle + Math.PI) * 5;
+        }
+
         if (dist < 20 + food.size) {
+          sounds.playEat();
           socket.emit("eatFood", food.id);
-          newScore += Math.floor(food.size);
+          newScore += Math.floor(food.size) * scoreMultiplier;
           segmentsToAdd += 1;
         }
       });
@@ -349,29 +502,59 @@ export default function App() {
         }
       }
 
-      // Check collisions with other players
-      let died = false;
-      Object.entries(players).forEach(([id, player]) => {
-        if (id === socket.id) return;
-        const p = player as Player;
-
-        p.segments.forEach((seg, idx) => {
-          const dx = newHead.x - seg.x;
-          const dy = newHead.y - seg.y;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-
-          if (dist < 20) {
-            // Collision! Check size
-            if (me.segments.length < p.segments.length) {
-              died = true;
-            }
-          }
-        });
+      // Check collisions with powerups
+      powerups.forEach((p) => {
+        const dx = newHead.x - p.x;
+        const dy = newHead.y - p.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 30) {
+          socket.emit("collectPowerup", p.id);
+        }
       });
 
+      // Check collisions with obstacles
+      let died = false;
+      obstacles.forEach((obs) => {
+        if (
+          newHead.x > obs.x &&
+          newHead.x < obs.x + obs.width &&
+          newHead.y > obs.y &&
+          newHead.y < obs.y + obs.height
+        ) {
+          died = true;
+        }
+      });
+
+      // Check collisions with other players
+      const isInvincible = activePowerups["invincibility"] && activePowerups["invincibility"] > Date.now();
+      if (!isInvincible) {
+        Object.entries(players).forEach(([id, player]) => {
+          if (id === socket.id) return;
+          const p = player as Player;
+
+          // Team mode: Teammates don't kill each other
+          if (gameConfig.isTeamMode && me.team === p.team) return;
+
+          p.segments.forEach((seg, idx) => {
+            const dx = newHead.x - seg.x;
+            const dy = newHead.y - seg.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+
+            if (dist < 20) {
+              // Collision! Check size
+              if (me.segments.length < p.segments.length) {
+                died = true;
+              }
+            }
+          });
+        });
+      }
+
       if (died) {
+        sounds.playDeath();
         setGameState("dead");
         socket.emit("playerDied");
+        if (me) recordHighScore(me);
         return;
       }
 
@@ -418,6 +601,45 @@ export default function App() {
           ctx.stroke();
         }
 
+        // Draw obstacles
+        obstacles.forEach((obs) => {
+          ctx.fillStyle = obs.color;
+          ctx.shadowBlur = obs.isMoving ? 15 : 0;
+          ctx.shadowColor = obs.color;
+          ctx.fillRect(obs.x, obs.y, obs.width, obs.height);
+          
+          // Add some texture/border to obstacles
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(obs.x, obs.y, obs.width, obs.height);
+          ctx.shadowBlur = 0;
+        });
+
+        // Draw powerups
+        powerups.forEach((p) => {
+          ctx.fillStyle = p.color;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 15, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Glow
+          ctx.shadowBlur = 20;
+          ctx.shadowColor = p.color;
+          ctx.fill();
+          ctx.shadowBlur = 0;
+
+          // Icon representation
+          ctx.fillStyle = "white";
+          ctx.font = "bold 12px sans-serif";
+          ctx.textAlign = "center";
+          let icon = "";
+          if (p.type === "speed") icon = "⚡";
+          if (p.type === "invincibility") icon = "🛡️";
+          if (p.type === "magnet") icon = "🧲";
+          if (p.type === "multiplier") icon = "2x";
+          ctx.fillText(icon, p.x, p.y + 4);
+        });
+
         // Draw food
         foods.forEach((food) => {
           ctx.fillStyle = food.color;
@@ -451,10 +673,19 @@ export default function App() {
   }, [gameState, me, socket, players, foods, spectateTargetId, leaderboard]);
 
   const drawSnake = (ctx: CanvasRenderingContext2D, player: Player) => {
+    const isMe = player.id === socket?.id;
+    const isInvincible = isMe ? (activePowerups["invincibility"] && activePowerups["invincibility"] > Date.now()) : false;
+
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.lineWidth = 20;
     ctx.strokeStyle = player.color;
+
+    if (isInvincible) {
+      ctx.shadowBlur = 20;
+      ctx.shadowColor = "#8b5cf6";
+      ctx.strokeStyle = "#a78bfa";
+    }
 
     ctx.beginPath();
     ctx.moveTo(player.segments[0].x, player.segments[0].y);
@@ -462,6 +693,7 @@ export default function App() {
       ctx.lineTo(seg.x, seg.y);
     });
     ctx.stroke();
+    ctx.shadowBlur = 0;
 
     // Head
     ctx.fillStyle = player.color;
@@ -518,6 +750,7 @@ export default function App() {
   }, [gameLoop]);
 
   const saveSettings = () => {
+    sounds.playClick();
     if (!socket) return;
     socket.emit("updateSettings", tempConfig);
     setIsSettingsOpen(false);
@@ -547,9 +780,62 @@ export default function App() {
             {isConnected ? "Server Connected" : "Connecting..."}
           </span>
         </div>
+        <button
+          onClick={() => {
+            sounds.playClick();
+            setIsMuted(!isMuted);
+          }}
+          className="pointer-events-auto flex items-center gap-2 bg-black/50 backdrop-blur-md px-3 py-2 rounded-lg border border-white/10 w-fit hover:bg-white/10 transition-all group"
+        >
+          {isMuted ? (
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 text-red-400">🔇</div>
+              <span className="text-[10px] uppercase tracking-widest font-bold text-red-400/70">Audio Muted</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 text-green-400">🔊</div>
+              <span className="text-[10px] uppercase tracking-widest font-bold text-green-400/70">Audio Active</span>
+            </div>
+          )}
+        </button>
       </div>
 
-      <div className="absolute top-4 right-4 w-64 pointer-events-none">
+      <div className="absolute top-4 right-4 w-64 pointer-events-none space-y-4">
+        {gameConfig.isTeamMode && (
+          <div className="bg-black/50 backdrop-blur-md p-4 rounded-xl border border-white/10 space-y-3">
+            <div className="text-[10px] font-black uppercase tracking-widest text-white/40 border-b border-white/10 pb-2">Team Scores</div>
+            <div className="space-y-2">
+              <div className="flex justify-between items-center">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 rounded-full bg-red-500" />
+                  <span className="text-xs font-bold text-red-400">RED</span>
+                </div>
+                <span className="text-xs font-mono">{teamScores.red}</span>
+              </div>
+              <div className="w-full bg-white/5 h-1 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-red-500 transition-all duration-500" 
+                  style={{ width: `${(teamScores.red / (teamScores.red + teamScores.blue || 1)) * 100}%` }}
+                />
+              </div>
+              <div className="flex justify-between items-center">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 rounded-full bg-blue-500" />
+                  <span className="text-xs font-bold text-blue-400">BLUE</span>
+                </div>
+                <span className="text-xs font-mono">{teamScores.blue}</span>
+              </div>
+              <div className="w-full bg-white/5 h-1 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-blue-500 transition-all duration-500" 
+                  style={{ width: `${(teamScores.blue / (teamScores.red + teamScores.blue || 1)) * 100}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="bg-black/50 backdrop-blur-md p-4 rounded-xl border border-white/10">
           <div className="flex items-center gap-2 mb-3 border-b border-white/10 pb-2">
             <Trophy className="w-5 h-5 text-yellow-400" />
@@ -557,17 +843,78 @@ export default function App() {
           </div>
           <div className="space-y-2">
             {leaderboard.map((player, i) => (
-              <div key={`${player.id}-${i}`} className={cn("flex justify-between items-center text-sm", player.id === socket?.id && "text-yellow-400 font-bold")}>
+              <div key={`leaderboard-${player.id}-${i}`} className={cn("flex justify-between items-center text-sm", player.id === socket?.id && "text-yellow-400 font-bold")}>
                 <span className="truncate max-w-[120px]">{i + 1}. {player.name}</span>
                 <span>{player.score}</span>
               </div>
             ))}
           </div>
         </div>
+
+        <div className="bg-black/50 backdrop-blur-md p-4 rounded-xl border border-white/10">
+          <div className="flex items-center gap-2 mb-3 border-b border-white/10 pb-2">
+            <Sparkles className="w-5 h-5 text-blue-400" />
+            <span className="font-bold uppercase tracking-wider text-sm">Hall of Fame</span>
+          </div>
+          <div className="space-y-2">
+            {globalHighScores.length === 0 ? (
+              <div className="text-[10px] text-white/20 italic text-center py-2">No legends yet...</div>
+            ) : (
+              globalHighScores.map((score, i) => (
+                <div key={`global-${score.id}-${i}`} className="flex justify-between items-center text-xs">
+                  <div className="flex items-center gap-2">
+                    <span className="text-white/30 font-mono">{i + 1}.</span>
+                    <span className="truncate max-w-[100px] font-medium">{score.playerName}</span>
+                    {score.team && (
+                      <div className={cn("w-1.5 h-1.5 rounded-full", score.team === "red" ? "bg-red-500" : "bg-blue-500")} />
+                    )}
+                  </div>
+                  <span className="font-bold text-white/70">{score.score}</span>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
       </div>
 
       {me && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 pointer-events-none">
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 pointer-events-none flex flex-col items-center gap-4">
+          {/* Active Powerups UI */}
+          <div className="flex gap-2">
+            {Object.entries(activePowerups).map(([type, endTime]) => {
+              const timeLeft = Math.max(0, Math.floor(((endTime as number) - Date.now()) / 1000));
+              if (timeLeft <= 0) return null;
+              
+              const colors: Record<string, string> = {
+                speed: "bg-yellow-500",
+                invincibility: "bg-purple-500",
+                magnet: "bg-pink-500",
+                multiplier: "bg-green-500"
+              };
+              
+              const icons: Record<string, string> = {
+                speed: "⚡",
+                invincibility: "🛡️",
+                magnet: "🧲",
+                multiplier: "2x"
+              };
+
+              return (
+                <motion.div
+                  key={type}
+                  initial={{ scale: 0, y: 20 }}
+                  animate={{ scale: 1, y: 0 }}
+                  exit={{ scale: 0, y: 20 }}
+                  className={cn("px-3 py-1.5 rounded-full flex items-center gap-2 border border-white/20 shadow-lg backdrop-blur-md", colors[type])}
+                >
+                  <span className="text-sm">{icons[type]}</span>
+                  <span className="text-[10px] font-black uppercase tracking-widest">{type}</span>
+                  <span className="text-xs font-bold bg-black/20 px-1.5 py-0.5 rounded-md">{timeLeft}s</span>
+                </motion.div>
+              );
+            })}
+          </div>
+
           <div className="flex flex-col items-center gap-2">
             <div className="text-4xl font-black tracking-tighter drop-shadow-lg">
               {me.score}
@@ -590,6 +937,7 @@ export default function App() {
       <AnimatePresence>
         {isSettingsOpen && (
           <motion.div
+            key="settings-overlay"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -630,11 +978,44 @@ export default function App() {
                     />
                   </div>
                   <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Team Mode</label>
+                    <button
+                      onClick={() => {
+                        sounds.playClick();
+                        setTempConfig({ ...tempConfig, isTeamMode: !tempConfig.isTeamMode });
+                      }}
+                      className={cn(
+                        "w-full py-3 rounded-xl border transition-all text-xs font-black uppercase tracking-widest",
+                        tempConfig.isTeamMode ? "bg-green-500/20 border-green-500 text-green-400" : "bg-white/5 border-white/10 text-white/40"
+                      )}
+                    >
+                      {tempConfig.isTeamMode ? "Enabled" : "Disabled"}
+                    </button>
+                  </div>
+                  <div className="space-y-2">
                     <label className="text-xs font-bold uppercase tracking-widest text-white/40">Food Count</label>
                     <input
                       type="number"
                       value={tempConfig.maxFood}
                       onChange={(e) => setTempConfig({ ...tempConfig, maxFood: parseInt(e.target.value) || 0 })}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Powerups</label>
+                    <input
+                      type="number"
+                      value={tempConfig.maxPowerups}
+                      onChange={(e) => setTempConfig({ ...tempConfig, maxPowerups: parseInt(e.target.value) || 0 })}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold uppercase tracking-widest text-white/40">Obstacles</label>
+                    <input
+                      type="number"
+                      value={tempConfig.maxObstacles}
+                      onChange={(e) => setTempConfig({ ...tempConfig, maxObstacles: parseInt(e.target.value) || 0 })}
                       className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
                     />
                   </div>
@@ -672,7 +1053,10 @@ export default function App() {
 
               <div className="p-8 bg-white/5 border-t border-white/5 flex gap-4">
                 <button
-                  onClick={() => setIsSettingsOpen(false)}
+                  onClick={() => {
+                    sounds.playClick();
+                    setIsSettingsOpen(false);
+                  }}
                   className="flex-1 bg-white/5 hover:bg-white/10 text-white font-bold py-4 rounded-2xl transition-all border border-white/10"
                 >
                   Cancel
@@ -691,6 +1075,7 @@ export default function App() {
 
         {isPaused && gameState === "playing" && (
           <motion.div
+            key="paused-overlay"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -714,6 +1099,7 @@ export default function App() {
 
         {gameState === "menu" && (
           <motion.div
+            key="menu-overlay"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -736,6 +1122,40 @@ export default function App() {
                   className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-xl focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
                   onKeyDown={(e) => e.key === "Enter" && joinGame()}
                 />
+
+                {gameConfig.isTeamMode && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={() => {
+                        sounds.playClick();
+                        setSelectedTeam("red");
+                      }}
+                      className={cn(
+                        "py-3 rounded-xl border transition-all flex flex-col items-center gap-1",
+                        selectedTeam === "red" 
+                          ? "bg-red-500/20 border-red-500 text-red-400 shadow-[0_0_15px_rgba(239,68,68,0.3)]" 
+                          : "bg-white/5 border-white/10 text-white/40 hover:bg-white/10"
+                      )}
+                    >
+                      <span className="text-[10px] font-black uppercase tracking-widest">Team Red</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        sounds.playClick();
+                        setSelectedTeam("blue");
+                      }}
+                      className={cn(
+                        "py-3 rounded-xl border transition-all flex flex-col items-center gap-1",
+                        selectedTeam === "blue" 
+                          ? "bg-blue-500/20 border-blue-500 text-blue-400 shadow-[0_0_15px_rgba(59,130,246,0.3)]" 
+                          : "bg-white/5 border-white/10 text-white/40 hover:bg-white/10"
+                      )}
+                    >
+                      <span className="text-[10px] font-black uppercase tracking-widest">Team Blue</span>
+                    </button>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 gap-4">
                   <button
                     onClick={joinGame}
@@ -751,7 +1171,10 @@ export default function App() {
                   </button>
                 </div>
                 <button
-                  onClick={() => setIsSettingsOpen(true)}
+                  onClick={() => {
+                    sounds.playClick();
+                    setIsSettingsOpen(true);
+                  }}
                   className="w-full bg-white/5 text-white/70 font-bold text-sm py-3 rounded-xl hover:bg-white/10 transition-all border border-white/5 flex items-center justify-center gap-2"
                 >
                   <Settings className="w-4 h-4" />
@@ -775,6 +1198,7 @@ export default function App() {
 
         {gameState === "dead" && (
           <motion.div
+            key="dead-overlay"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             className="absolute inset-0 bg-red-950/80 backdrop-blur-xl flex items-center justify-center p-6 z-50"
@@ -822,13 +1246,19 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-4">
                 <button
-                  onClick={() => setGameState("menu")}
+                  onClick={() => {
+                    sounds.playClick();
+                    setGameState("menu");
+                  }}
                   className="bg-white text-black font-bold text-xl py-4 rounded-2xl hover:scale-[1.02] active:scale-[0.98] transition-all"
                 >
                   Try Again
                 </button>
                 <button
-                  onClick={startSpectating}
+                  onClick={() => {
+                    sounds.playClick();
+                    startSpectating();
+                  }}
                   className="bg-white/10 text-white font-bold text-xl py-4 rounded-2xl hover:bg-white/20 transition-all border border-white/10"
                 >
                   Spectate
@@ -839,13 +1269,13 @@ export default function App() {
         )}
 
         {(gameState === "spectating" || (gameState === "playing" && (isPaused || isPlayerChatVisible))) && (
-          <>
-            <motion.div
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: 20 }}
-              className="absolute top-20 right-4 w-80 h-96 bg-black/60 backdrop-blur-xl border border-white/10 rounded-3xl flex flex-col overflow-hidden z-50"
-            >
+          <motion.div
+            key="chat-overlay"
+            initial={{ opacity: 0, x: 20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 20 }}
+            className="absolute top-20 right-4 w-80 h-96 bg-black/60 backdrop-blur-xl border border-white/10 rounded-3xl flex flex-col overflow-hidden z-50"
+          >
               <div className="p-4 border-b border-white/10 flex items-center justify-between bg-white/5">
                 <span className="text-xs font-black uppercase tracking-widest text-white/50">
                   {gameState === "spectating" ? "Spectator Chat" : "Arena Chat"}
@@ -863,7 +1293,7 @@ export default function App() {
                   </div>
                 ) : (
                   chatMessages.map((msg, i) => (
-                    <div key={`${msg.id}-${i}`} className="space-y-1">
+                    <div key={`chat-${msg.id}-${i}`} className="space-y-1">
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] font-black text-white/40 uppercase tracking-tighter">
                           {msg.sender}
@@ -891,11 +1321,11 @@ export default function App() {
                 />
               </form>
             </motion.div>
-          </>
         )}
 
         {gameState === "spectating" && (
           <motion.div
+            key="spectator-ui"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             className="absolute bottom-12 left-1/2 -translate-x-1/2 flex flex-col items-center gap-4 z-50"

@@ -1,0 +1,36 @@
+{
+  "entities": {
+    "HighScore": {
+      "title": "HighScore",
+      "description": "A record of a player's high score in the arena.",
+      "type": "object",
+      "properties": {
+        "playerName": {
+          "type": "string",
+          "description": "The name of the player."
+        },
+        "score": {
+          "type": "number",
+          "description": "The score achieved."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the score was recorded."
+        },
+        "team": {
+          "type": "string",
+          "enum": ["red", "blue"],
+          "description": "The team the player was on, if any."
+        }
+      },
+      "required": ["playerName", "score", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/high_scores/{scoreId}": {
+      "schema": "HighScore",
+      "description": "Global leaderboard of high scores."
+    }
+  }
+}

@@ -1,0 +1,52 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: high_scores
+    // Fields:
+    //   - playerName: string (required, 1-15 chars)
+    //   - score: number (required, positive)
+    //   - timestamp: timestamp (required)
+    //   - team: string (optional, enum: ['red', 'blue'])
+    //
+    // ===============================================================
+
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "alimtas12@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidHighScore(data) {
+      return data.keys().hasAll(['playerName', 'score', 'timestamp']) &&
+             data.playerName is string && data.playerName.size() > 0 && data.playerName.size() <= 15 &&
+             data.score is number && data.score >= 0 &&
+             data.timestamp is timestamp &&
+             (!('team' in data) || data.team in ['red', 'blue']);
+    }
+
+    match /high_scores/{scoreId} {
+      // Allow anyone to read high scores for the leaderboard
+      allow read: if true;
+      
+      // Allow creation of high scores if the data is valid
+      // In a production app, we'd want to verify the score isn't spoofed
+      allow create: if isValidHighScore(request.resource.data);
+      
+      // Only admins can update or delete scores
+      allow update, delete: if isAdmin();
+    }
+
+    match /test/connection {
+      allow read: if true;
+    }
+  }
+}
